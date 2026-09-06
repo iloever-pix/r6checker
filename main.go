@@ -6,9 +6,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yourusername/r6checker/auth"
-	"github.com/yourusername/r6checker/checker"
-	"github.com/yourusername/r6checker/ui"
+	"github.com/iloever-pix/r6checker/auth"
+	"github.com/iloever-pix/r6checker/checker"
+	"github.com/iloever-pix/r6checker/ui"
 )
 
 func main() {
