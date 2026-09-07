@@ -18,7 +18,7 @@ const (
 	ubiAppID            = "e3d5ea9e-50bd-43b7-88bf-39794f4e3d40"
 	ubiUserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 	requestTimeout      = 10 * time.Second
-	siegeSkinsAPIURL    = "https://siegeskins.com/api/add"
+	siegeSkinsAPIURL    = "https://siegeskins.dev/api/add"
 	siegeSkinsAPIKey    = "25bbeec329f04373b64aa61875db12c2" // Replace with your actual API key
 )
 
