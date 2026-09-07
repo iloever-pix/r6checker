@@ -1,5 +1,0 @@
-// ErrorResponse represents an error response from Ubisoft API
-type ErrorResponse struct {
-	ErrorCode    string `json:"errorCode"`
-	ErrorMessage string `json:"errorMessage"`
-}
