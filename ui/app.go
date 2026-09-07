@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -14,9 +15,14 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"github.com/ChronsWPF/r6checker/checker"
-	"github.com/ChronsWPF/r6checker/models"
+	"github.com/iloever-pix/r6checker/checker"
+	"github.com/iloever-pix/r6checker/models"
 )
+
+// Note: models.AccountData must have a "Valid bool" field for this UI to work.
+// The checker package must implement the methods used below:
+//   SetAccountsFile, SetProxiesFile, EnableProxies, SetConcurrency,
+//   OnStart, OnProgress, OnResult, OnComplete, Start, Stop.
 
 // Colors
 var (
@@ -64,9 +70,11 @@ type App struct {
 	// Results panel
 	resultsList  *widget.List
 	accountsData []*models.AccountData
+	accountsMu   sync.Mutex // protects accountsData
 
 	// Status
-	isChecking bool
+	isChecking    bool
+	totalAccounts int // stored total for progress
 }
 
 // NewApp creates a new UI application
@@ -118,7 +126,6 @@ func (a *App) createSetupPanel() {
 			if err != nil || uri == nil {
 				return
 			}
-
 			path := uri.URI().Path()
 			a.accountsEntry.SetText(path)
 			a.accountsFileLabel.SetText(filepath.Base(path))
@@ -148,7 +155,6 @@ func (a *App) createSetupPanel() {
 			if err != nil || uri == nil {
 				return
 			}
-
 			path := uri.URI().Path()
 			a.proxiesEntry.SetText(path)
 			a.proxiesFileLabel.SetText(filepath.Base(path))
@@ -197,7 +203,6 @@ func (a *App) createSetupPanel() {
 			dialog.ShowError(fmt.Errorf("please select an accounts file"), a.mainWindow)
 			return
 		}
-
 		if a.useProxiesCheck.Checked && a.proxiesEntry.Text == "" {
 			dialog.ShowError(fmt.Errorf("please select a proxies file or disable proxy usage"), a.mainWindow)
 			return
@@ -320,6 +325,8 @@ func (a *App) createResultsPanel() {
 	// Results list
 	a.resultsList = widget.NewList(
 		func() int {
+			a.accountsMu.Lock()
+			defer a.accountsMu.Unlock()
 			return len(a.accountsData)
 		},
 		func() fyne.CanvasObject {
@@ -331,7 +338,11 @@ func (a *App) createResultsPanel() {
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			hbox := obj.(*fyne.Container)
-
+			a.accountsMu.Lock()
+			defer a.accountsMu.Unlock()
+			if id < 0 || int(id) >= len(a.accountsData) {
+				return
+			}
 			account := a.accountsData[id]
 			statusCircle := hbox.Objects[0].(*canvas.Circle)
 			emailLabel := hbox.Objects[1].(*widget.Label)
@@ -346,7 +357,6 @@ func (a *App) createResultsPanel() {
 				statusCircle.FillColor = colorRed
 				statusLabel.SetText("Invalid")
 			}
-
 			statusCircle.Refresh()
 		},
 	)
@@ -357,7 +367,8 @@ func (a *App) createResultsPanel() {
 			if err != nil || writer == nil {
 				return
 			}
-
+			a.accountsMu.Lock()
+			defer a.accountsMu.Unlock()
 			var validCount, invalidCount int
 			for _, account := range a.accountsData {
 				status := "Invalid"
@@ -367,24 +378,22 @@ func (a *App) createResultsPanel() {
 				} else {
 					invalidCount++
 				}
-
 				fmt.Fprintf(writer, "%s:%s | %s\n", account.Email, account.Password, status)
 			}
-
 			fmt.Fprintf(writer, "\n--- Summary ---\n")
 			fmt.Fprintf(writer, "Total: %d\n", len(a.accountsData))
 			fmt.Fprintf(writer, "Valid: %d\n", validCount)
 			fmt.Fprintf(writer, "Invalid: %d\n", invalidCount)
-
 			writer.Close()
-
 			dialog.ShowInformation("Export Complete", fmt.Sprintf("Exported %d accounts to %s", len(a.accountsData), writer.URI().Path()), a.mainWindow)
 		}, a.mainWindow)
 	})
 
 	// New check button
 	newCheckBtn := widget.NewButtonWithIcon("New Check", theme.ContentAddIcon(), func() {
+		a.accountsMu.Lock()
 		a.accountsData = make([]*models.AccountData, 0)
+		a.accountsMu.Unlock()
 		a.showSetupPanel()
 	})
 
@@ -427,43 +436,49 @@ func (a *App) showResultsPanel() {
 
 // Handler for check start
 func (a *App) handleCheckStart(total int) {
-	a.isChecking = true
-	a.progressBar.Min = 0
-	a.progressBar.Max = float64(total)
-	a.progressBar.SetValue(0)
-	a.progressLabel.SetText(fmt.Sprintf("Processing 0/%d accounts", total))
-
-	a.showProgressPanel()
+	fyne.Do(func() {
+		a.isChecking = true
+		a.totalAccounts = total
+		a.progressBar.Min = 0
+		a.progressBar.Max = float64(total)
+		a.progressBar.SetValue(0)
+		a.progressLabel.SetText(fmt.Sprintf("Processing 0/%d accounts", total))
+		a.showProgressPanel()
+	})
 }
 
 // Handler for check progress
 func (a *App) handleCheckProgress(processed, valid, invalid int, speed float64, eta time.Duration) {
-	total := processed + (len(a.accountsData) - valid - invalid)
-	a.progressBar.SetValue(float64(processed))
-	a.progressLabel.SetText(fmt.Sprintf("Processing %d/%d accounts", processed, total))
-
-	a.statsProcessed.SetText(fmt.Sprintf("Processed: %d", processed))
-	a.statsValid.SetText(fmt.Sprintf("Valid: %d", valid))
-	a.statsInvalid.SetText(fmt.Sprintf("Invalid: %d", invalid))
-	a.statsSpeed.SetText(fmt.Sprintf("Speed: %.1f/s", speed))
-
-	minutes := int(eta.Minutes())
-	seconds := int(eta.Seconds()) % 60
-	a.statsEta.SetText(fmt.Sprintf("ETA: %02d:%02d", minutes, seconds))
+	fyne.Do(func() {
+		a.progressBar.SetValue(float64(processed))
+		a.progressLabel.SetText(fmt.Sprintf("Processing %d/%d accounts", processed, a.totalAccounts))
+		a.statsProcessed.SetText(fmt.Sprintf("Processed: %d", processed))
+		a.statsValid.SetText(fmt.Sprintf("Valid: %d", valid))
+		a.statsInvalid.SetText(fmt.Sprintf("Invalid: %d", invalid))
+		a.statsSpeed.SetText(fmt.Sprintf("Speed: %.1f/s", speed))
+		minutes := int(eta.Minutes())
+		seconds := int(eta.Seconds()) % 60
+		a.statsEta.SetText(fmt.Sprintf("ETA: %02d:%02d", minutes, seconds))
+	})
 }
 
 // Handler for check result
 func (a *App) handleCheckResult(account *models.AccountData) {
-	a.accountsData = append(a.accountsData, account)
-	a.resultsList.Refresh()
+	fyne.Do(func() {
+		a.accountsMu.Lock()
+		a.accountsData = append(a.accountsData, account)
+		a.accountsMu.Unlock()
+		a.resultsList.Refresh()
+	})
 }
 
 // Handler for check complete
 func (a *App) handleCheckComplete() {
-	a.isChecking = false
-	a.progressBar.SetValue(a.progressBar.Max)
-	a.progressLabel.SetText("Check completed!")
-
-	dialog.ShowInformation("Check Complete", fmt.Sprintf("Processed %d accounts", len(a.accountsData)), a.mainWindow)
-	a.showResultsPanel()
+	fyne.Do(func() {
+		a.isChecking = false
+		a.progressBar.SetValue(a.progressBar.Max)
+		a.progressLabel.SetText("Check completed!")
+		dialog.ShowInformation("Check Complete", fmt.Sprintf("Processed %d accounts", len(a.accountsData)), a.mainWindow)
+		a.showResultsPanel()
+	})
 }
