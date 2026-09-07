@@ -16,70 +16,62 @@ import (
 	"github.com/iloever-pix/r6checker/models"
 )
 
-// Checker handles the account checking process
 type Checker struct {
-	AuthClient      *auth.Client
-	ValidAccounts   []*models.AccountData
-	Stats           models.CheckerStats
-	DataDir         string
-	ProgressUpdates chan models.ProgressUpdate
-	resultsFile     string
-	mu              sync.Mutex
-	stopping        bool
-	ctx             context.Context
-	cancel          context.CancelFunc
+	AuthClient          *auth.Client
+	ValidAccounts       []*models.AccountData
+	Stats               models.CheckerStats
+	DataDir             string
+	ProgressUpdates     chan models.ProgressUpdate
+	resultsFile         string
+	mu                  sync.Mutex
+	stopping            bool
+	ctx                 context.Context
+	cancel              context.CancelFunc
 	fetchSiegeSkinsData bool
 	detailedInfoLimit   int
 
-	// Configuration setters used by UI
 	accountsFile string
 	proxiesFile  string
 	useProxies   bool
 	concurrency  int
 
-	// Callbacks
 	onStart    func(int)
 	onProgress func(int, int, int, float64, time.Duration)
 	onResult   func(*models.AccountData)
 	onComplete func()
 }
 
-// NewChecker creates a new account checker
 func NewChecker(dataDir string) *Checker {
 	return &Checker{
-		AuthClient:      auth.NewClient(),
-		ValidAccounts:   make([]*models.AccountData, 0),
-		DataDir:         dataDir,
-		ProgressUpdates: make(chan models.ProgressUpdate, 100),
-		resultsFile:     filepath.Join(dataDir, "valid_accounts.json"),
+		AuthClient:          auth.NewClient(),
+		ValidAccounts:       make([]*models.AccountData, 0),
+		DataDir:             dataDir,
+		ProgressUpdates:     make(chan models.ProgressUpdate, 100),
+		resultsFile:         filepath.Join(dataDir, "valid_accounts.json"),
 		fetchSiegeSkinsData: true,
 		detailedInfoLimit:   5,
 		concurrency:         10,
 	}
 }
 
-// SetAccountsFile sets the accounts file path
 func (c *Checker) SetAccountsFile(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.accountsFile = path
 }
 
-// SetProxiesFile sets the proxies file path
 func (c *Checker) SetProxiesFile(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.proxiesFile = path
 }
 
-// EnableProxies enables or disables proxy usage
 func (c *Checker) EnableProxies(enabled bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.useProxies = enabled
 }
 
-// SetConcurrency sets the number of worker goroutines
 func (c *Checker) SetConcurrency(n int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -92,35 +84,30 @@ func (c *Checker) SetConcurrency(n int) {
 	c.concurrency = n
 }
 
-// OnStart registers a callback for check start
 func (c *Checker) OnStart(fn func(int)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onStart = fn
 }
 
-// OnProgress registers a callback for progress updates
 func (c *Checker) OnProgress(fn func(int, int, int, float64, time.Duration)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onProgress = fn
 }
 
-// OnResult registers a callback for each result
 func (c *Checker) OnResult(fn func(*models.AccountData)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onResult = fn
 }
 
-// OnComplete registers a callback for completion
 func (c *Checker) OnComplete(fn func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onComplete = fn
 }
 
-// Start loads accounts/proxies and begins checking
 func (c *Checker) Start() {
 	c.mu.Lock()
 	if c.accountsFile == "" {
@@ -161,7 +148,6 @@ func (c *Checker) Start() {
 	c.StartChecking(accounts, concurrency, true)
 }
 
-// Stop stops the checking process
 func (c *Checker) Stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -171,7 +157,6 @@ func (c *Checker) Stop() {
 	c.stopping = true
 }
 
-// LoadAccounts loads account credentials from a file
 func (c *Checker) LoadAccounts(filename string) ([]models.AccountCredentials, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -198,7 +183,6 @@ func (c *Checker) LoadAccounts(filename string) ([]models.AccountCredentials, er
 	return accounts, nil
 }
 
-// LoadProxies loads proxies from a file
 func (c *Checker) LoadProxies(filename string) ([]string, error) {
 	if filename == "" {
 		return nil, nil
@@ -224,9 +208,7 @@ func (c *Checker) LoadProxies(filename string) ([]string, error) {
 	return proxies, nil
 }
 
-// StartChecking starts the account checking process
 func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrency int, clearPrevious bool) {
-	// Reset stats
 	c.mu.Lock()
 	c.Stats = models.CheckerStats{
 		StartTime: time.Now(),
@@ -235,21 +217,16 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 	if clearPrevious {
 		c.ValidAccounts = make([]*models.AccountData, 0)
 	}
-	// Create a new context for this run
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ctx = ctx
 	c.cancel = cancel
 	c.mu.Unlock()
 
-	// Notify start callback
 	if c.onStart != nil {
 		c.onStart(len(accounts))
 	}
 
-	// Create results directory if it doesn't exist
 	os.MkdirAll(filepath.Dir(c.resultsFile), 0755)
-
-	// Clear previous results file if requested
 	if clearPrevious {
 		os.WriteFile(c.resultsFile, []byte("[]"), 0644)
 	}
@@ -258,7 +235,6 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 	jobs := make(chan models.AccountCredentials, total)
 	results := make(chan models.CheckResult, total)
 
-	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -283,7 +259,6 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 		}(i)
 	}
 
-	// Start result collector
 	collectorDone := make(chan struct{})
 	go func() {
 		defer close(collectorDone)
@@ -296,7 +271,6 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 				if result.Valid && result.Account != nil {
 					c.ValidAccounts = append(c.ValidAccounts, result.Account)
 					c.Stats.Valid++
-					// Unlock before potentially slow file write
 					accountToSave := result.Account
 					c.mu.Unlock()
 					c.saveAccount(accountToSave)
@@ -325,7 +299,6 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 				}
 			}
 		}
-		// Final stats
 		c.mu.Lock()
 		c.Stats.EndTime = time.Now()
 		c.Stats.ElapsedTime = c.Stats.EndTime.Sub(c.Stats.StartTime).Seconds()
@@ -339,7 +312,6 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 		}
 	}()
 
-	// Feed accounts
 	for _, account := range accounts {
 		select {
 		case jobs <- account:
@@ -349,32 +321,27 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 	}
 	close(jobs)
 
-	// Wait for workers
 	wg.Wait()
 	close(results)
-	<-collectorDone // wait for collector to finish
+	<-collectorDone
 }
 
-// StopChecking is an alias for Stop to maintain compatibility
 func (c *Checker) StopChecking() {
 	c.Stop()
 }
 
-// GetValidAccounts returns the list of valid accounts
 func (c *Checker) GetValidAccounts() []*models.AccountData {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ValidAccounts
 }
 
-// GetStats returns the current checker statistics
 func (c *Checker) GetStats() models.CheckerStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.Stats
 }
 
-// checkAccount checks a single account
 func (c *Checker) checkAccount(ctx context.Context, creds models.AccountCredentials, workerID int) models.CheckResult {
 	select {
 	case <-ctx.Done():
@@ -390,7 +357,7 @@ func (c *Checker) checkAccount(ctx context.Context, creds models.AccountCredenti
 	}
 
 	accountData.CreatedAt = time.Now()
-	accountData.Valid = true // Mark as valid; later should be refined with 2FA/banned detection
+	accountData.Valid = true
 
 	c.mu.Lock()
 	validCount := c.Stats.Valid
@@ -414,7 +381,6 @@ func (c *Checker) checkAccount(ctx context.Context, creds models.AccountCredenti
 	}
 }
 
-// saveAccount saves a valid account to the results file (without holding c.mu)
 func (c *Checker) saveAccount(account *models.AccountData) error {
 	var accounts []*models.AccountData
 	data, err := os.ReadFile(c.resultsFile)
@@ -436,7 +402,6 @@ func (c *Checker) saveAccount(account *models.AccountData) error {
 	return nil
 }
 
-// ExportAccounts exports valid accounts to a file
 func (c *Checker) ExportAccounts(filename string, format string) error {
 	c.mu.Lock()
 	accounts := c.ValidAccounts
@@ -460,7 +425,6 @@ func (c *Checker) ExportAccounts(filename string, format string) error {
 		for _, account := range accounts {
 			line := fmt.Sprintf("%s:%s | Username: %s | ID: %s",
 				account.Email, account.Password, account.Username, account.ProfileID)
-
 			if account.SiegeSkinsData != nil {
 				line += fmt.Sprintf(" | Level: %d | Renown: %d | Credits: %d",
 					account.SiegeSkinsData.Level, account.SiegeSkinsData.Renown, account.SiegeSkinsData.Credits)
@@ -478,7 +442,6 @@ func (c *Checker) ExportAccounts(filename string, format string) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
-// FormatTime formats seconds into minutes and seconds
 func FormatTime(seconds float64) string {
 	mins := int(math.Floor(seconds / 60))
 	secs := int(math.Floor(seconds)) % 60
