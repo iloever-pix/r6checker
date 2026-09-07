@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourusername/r6checker/auth"
-	"github.com/yourusername/r6checker/models"
+	"github.com/iloever-pix/r6checker/auth"
+	"github.com/iloever-pix/r6checker/models"
 )
 
 // Checker handles the account checking process
