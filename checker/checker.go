@@ -2,6 +2,7 @@ package checker
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -25,8 +26,22 @@ type Checker struct {
 	resultsFile     string
 	mu              sync.Mutex
 	stopping        bool
+	ctx             context.Context
+	cancel          context.CancelFunc
 	fetchSiegeSkinsData bool
 	detailedInfoLimit   int
+
+	// Configuration setters used by UI
+	accountsFile string
+	proxiesFile  string
+	useProxies   bool
+	concurrency  int
+
+	// Callbacks
+	onStart    func(int)
+	onProgress func(int, int, int, float64, time.Duration)
+	onResult   func(*models.AccountData)
+	onComplete func()
 }
 
 // NewChecker creates a new account checker
@@ -38,8 +53,122 @@ func NewChecker(dataDir string) *Checker {
 		ProgressUpdates: make(chan models.ProgressUpdate, 100),
 		resultsFile:     filepath.Join(dataDir, "valid_accounts.json"),
 		fetchSiegeSkinsData: true,
-		detailedInfoLimit:   5, // Only fetch detailed info for first 5 accounts
+		detailedInfoLimit:   5,
+		concurrency:         10,
 	}
+}
+
+// SetAccountsFile sets the accounts file path
+func (c *Checker) SetAccountsFile(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.accountsFile = path
+}
+
+// SetProxiesFile sets the proxies file path
+func (c *Checker) SetProxiesFile(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.proxiesFile = path
+}
+
+// EnableProxies enables or disables proxy usage
+func (c *Checker) EnableProxies(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.useProxies = enabled
+}
+
+// SetConcurrency sets the number of worker goroutines
+func (c *Checker) SetConcurrency(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n < 1 {
+		n = 1
+	}
+	if n > 200 {
+		n = 200
+	}
+	c.concurrency = n
+}
+
+// OnStart registers a callback for check start
+func (c *Checker) OnStart(fn func(int)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onStart = fn
+}
+
+// OnProgress registers a callback for progress updates
+func (c *Checker) OnProgress(fn func(int, int, int, float64, time.Duration)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onProgress = fn
+}
+
+// OnResult registers a callback for each result
+func (c *Checker) OnResult(fn func(*models.AccountData)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onResult = fn
+}
+
+// OnComplete registers a callback for completion
+func (c *Checker) OnComplete(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onComplete = fn
+}
+
+// Start loads accounts/proxies and begins checking
+func (c *Checker) Start() {
+	c.mu.Lock()
+	if c.accountsFile == "" {
+		c.mu.Unlock()
+		return
+	}
+	accountsFile := c.accountsFile
+	proxiesFile := c.proxiesFile
+	useProxies := c.useProxies
+	concurrency := c.concurrency
+	c.mu.Unlock()
+
+	accounts, err := c.LoadAccounts(accountsFile)
+	if err != nil {
+		fmt.Printf("Error loading accounts: %v\n", err)
+		return
+	}
+	if len(accounts) == 0 {
+		fmt.Println("No accounts found.")
+		return
+	}
+
+	var proxies []string
+	if useProxies && proxiesFile != "" {
+		proxies, err = c.LoadProxies(proxiesFile)
+		if err != nil {
+			fmt.Printf("Error loading proxies: %v\n", err)
+			return
+		}
+	}
+
+	if len(proxies) > 0 {
+		c.AuthClient.SetProxies(proxies)
+	} else {
+		c.AuthClient.SetProxies(nil)
+	}
+
+	c.StartChecking(accounts, concurrency, true)
+}
+
+// Stop stops the checking process
+func (c *Checker) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.stopping = true
 }
 
 // LoadAccounts loads account credentials from a file
@@ -57,18 +186,15 @@ func (c *Checker) LoadAccounts(filename string) ([]models.AccountCredentials, er
 		if line == "" || !strings.Contains(line, ":") {
 			continue
 		}
-
 		parts := strings.SplitN(line, ":", 2)
 		accounts = append(accounts, models.AccountCredentials{
 			Email:    strings.TrimSpace(parts[0]),
 			Password: strings.TrimSpace(parts[1]),
 		})
 	}
-
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading accounts file: %w", err)
 	}
-
 	return accounts, nil
 }
 
@@ -77,7 +203,6 @@ func (c *Checker) LoadProxies(filename string) ([]string, error) {
 	if filename == "" {
 		return nil, nil
 	}
-
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open proxies file: %w", err)
@@ -93,11 +218,9 @@ func (c *Checker) LoadProxies(filename string) ([]string, error) {
 		}
 		proxies = append(proxies, line)
 	}
-
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading proxies file: %w", err)
 	}
-
 	return proxies, nil
 }
 
@@ -112,7 +235,16 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 	if clearPrevious {
 		c.ValidAccounts = make([]*models.AccountData, 0)
 	}
+	// Create a new context for this run
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx = ctx
+	c.cancel = cancel
 	c.mu.Unlock()
+
+	// Notify start callback
+	if c.onStart != nil {
+		c.onStart(len(accounts))
+	}
 
 	// Create results directory if it doesn't exist
 	os.MkdirAll(filepath.Dir(c.resultsFile), 0755)
@@ -122,15 +254,9 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 		os.WriteFile(c.resultsFile, []byte("[]"), 0644)
 	}
 
-	// Create worker pool
 	total := len(accounts)
 	jobs := make(chan models.AccountCredentials, total)
 	results := make(chan models.CheckResult, total)
-	
-	// Limit concurrency to reasonable number
-	if concurrency <= 0 || concurrency > 200 {
-		concurrency = 20
-	}
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -138,90 +264,100 @@ func (c *Checker) StartChecking(accounts []models.AccountCredentials, concurrenc
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for account := range jobs {
-				if c.stopping {
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case account, ok := <-jobs:
+					if !ok {
+						return
+					}
+					result := c.checkAccount(ctx, account, workerID)
+					select {
+					case results <- result:
+					case <-ctx.Done():
+						return
+					}
 				}
-				result := c.checkAccount(account, workerID)
-				results <- result
 			}
 		}(i)
 	}
 
 	// Start result collector
+	collectorDone := make(chan struct{})
 	go func() {
+		defer close(collectorDone)
 		for i := 0; i < total; i++ {
-			if c.stopping {
-				break
-			}
-
-			result := <-results
-			c.mu.Lock()
-			if result.Valid && result.Account != nil {
-				c.ValidAccounts = append(c.ValidAccounts, result.Account)
-				c.Stats.Valid++
-				
-				// Save account to results file
-				c.saveAccount(result.Account)
-			} else {
-				c.Stats.Invalid++
-			}
-			c.Stats.Processed++
-			processed := c.Stats.Processed
-			valid := c.Stats.Valid
-			invalid := c.Stats.Invalid
-			c.mu.Unlock()
-
-			// Send progress update
-			percent := int(float64(processed) / float64(total) * 100)
-			elapsed := time.Since(c.Stats.StartTime).Seconds()
-			speed := float64(processed) / elapsed
-			var eta float64
-			if speed > 0 {
-				eta = float64(total-processed) / speed
-			} else {
-				eta = 0
-			}
-
 			select {
-			case c.ProgressUpdates <- models.ProgressUpdate{
-				Processed: processed,
-				Total:     total,
-				Valid:     valid,
-				Invalid:   invalid,
-				Percent:   percent,
-				Speed:     speed,
-				ETA:       eta,
-			}:
-			default:
-				// Channel full, skip update
+			case <-ctx.Done():
+				return
+			case result := <-results:
+				c.mu.Lock()
+				if result.Valid && result.Account != nil {
+					c.ValidAccounts = append(c.ValidAccounts, result.Account)
+					c.Stats.Valid++
+					// Unlock before potentially slow file write
+					accountToSave := result.Account
+					c.mu.Unlock()
+					c.saveAccount(accountToSave)
+					if c.onResult != nil {
+						c.onResult(accountToSave)
+					}
+				} else {
+					c.Stats.Invalid++
+					c.mu.Unlock()
+				}
+				c.mu.Lock()
+				c.Stats.Processed++
+				processed := c.Stats.Processed
+				valid := c.Stats.Valid
+				invalid := c.Stats.Invalid
+				c.mu.Unlock()
+
+				elapsed := time.Since(c.Stats.StartTime).Seconds()
+				speed := float64(processed) / elapsed
+				var eta float64
+				if speed > 0 {
+					eta = float64(total-processed) / speed
+				}
+				if c.onProgress != nil {
+					c.onProgress(processed, valid, invalid, speed, time.Duration(eta)*time.Second)
+				}
 			}
 		}
-
-		// Final update
+		// Final stats
 		c.mu.Lock()
 		c.Stats.EndTime = time.Now()
 		c.Stats.ElapsedTime = c.Stats.EndTime.Sub(c.Stats.StartTime).Seconds()
-		c.Stats.Speed = float64(c.Stats.Processed) / c.Stats.ElapsedTime
+		if c.Stats.ElapsedTime > 0 {
+			c.Stats.Speed = float64(c.Stats.Processed) / c.Stats.ElapsedTime
+		}
 		c.mu.Unlock()
+
+		if c.onComplete != nil {
+			c.onComplete()
+		}
 	}()
 
-	// Send accounts to workers
+	// Feed accounts
 	for _, account := range accounts {
-		jobs <- account
+		select {
+		case jobs <- account:
+		case <-ctx.Done():
+			break
+		}
 	}
 	close(jobs)
 
-	// Wait for workers to finish
+	// Wait for workers
 	wg.Wait()
 	close(results)
+	<-collectorDone // wait for collector to finish
 }
 
-// StopChecking stops the account checking process
+// StopChecking is an alias for Stop to maintain compatibility
 func (c *Checker) StopChecking() {
-	c.mu.Lock()
-	c.stopping = true
-	c.mu.Unlock()
+	c.Stop()
 }
 
 // GetValidAccounts returns the list of valid accounts
@@ -239,8 +375,12 @@ func (c *Checker) GetStats() models.CheckerStats {
 }
 
 // checkAccount checks a single account
-func (c *Checker) checkAccount(creds models.AccountCredentials, workerID int) models.CheckResult {
-	// Try to log in
+func (c *Checker) checkAccount(ctx context.Context, creds models.AccountCredentials, workerID int) models.CheckResult {
+	select {
+	case <-ctx.Done():
+		return models.CheckResult{Valid: false, Error: "stopped"}
+	default:
+	}
 	accountData, err := c.AuthClient.Login(creds.Email, creds.Password)
 	if err != nil {
 		return models.CheckResult{
@@ -249,10 +389,9 @@ func (c *Checker) checkAccount(creds models.AccountCredentials, workerID int) mo
 		}
 	}
 
-	// Account is valid
 	accountData.CreatedAt = time.Now()
+	accountData.Valid = true // Mark as valid; later should be refined with 2FA/banned detection
 
-	// Get SiegeSkins data for the first few accounts
 	c.mu.Lock()
 	validCount := c.Stats.Valid
 	shouldFetchSiegeSkinsData := c.fetchSiegeSkinsData && validCount < c.detailedInfoLimit
@@ -261,10 +400,10 @@ func (c *Checker) checkAccount(creds models.AccountCredentials, workerID int) mo
 	if shouldFetchSiegeSkinsData && accountData.Ticket != "" && accountData.SessionID != "" {
 		if siegeSkinsData, err := c.AuthClient.GetSiegeSkinsData(accountData.Ticket, accountData.SessionID); err == nil {
 			accountData.SiegeSkinsData = siegeSkinsData
-			fmt.Printf("Worker %d - Got SiegeSkins data for %s: Level %d, Renown: %d\n", 
+			fmt.Printf("Worker %d - Got SiegeSkins data for %s: Level %d, Renown: %d\n",
 				workerID, creds.Email, siegeSkinsData.Level, siegeSkinsData.Renown)
 		} else {
-			fmt.Printf("Worker %d - Error fetching SiegeSkins data for %s: %s\n", 
+			fmt.Printf("Worker %d - Error fetching SiegeSkins data for %s: %s\n",
 				workerID, creds.Email, err.Error())
 		}
 	}
@@ -275,9 +414,8 @@ func (c *Checker) checkAccount(creds models.AccountCredentials, workerID int) mo
 	}
 }
 
-// saveAccount saves a valid account to the results file
+// saveAccount saves a valid account to the results file (without holding c.mu)
 func (c *Checker) saveAccount(account *models.AccountData) error {
-	// Read existing accounts
 	var accounts []*models.AccountData
 	data, err := os.ReadFile(c.resultsFile)
 	if err == nil {
@@ -287,20 +425,14 @@ func (c *Checker) saveAccount(account *models.AccountData) error {
 	} else {
 		accounts = make([]*models.AccountData, 0)
 	}
-
-	// Add new account
 	accounts = append(accounts, account)
-
-	// Write back to file
 	data, err = json.MarshalIndent(accounts, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal accounts: %w", err)
 	}
-
 	if err := os.WriteFile(c.resultsFile, data, 0644); err != nil {
 		return fmt.Errorf("failed to write accounts file: %w", err)
 	}
-
 	return nil
 }
 
@@ -326,17 +458,16 @@ func (c *Checker) ExportAccounts(filename string, format string) error {
 	case "txt":
 		var lines []string
 		for _, account := range accounts {
-			line := fmt.Sprintf("%s:%s | Username: %s | ID: %s", 
+			line := fmt.Sprintf("%s:%s | Username: %s | ID: %s",
 				account.Email, account.Password, account.Username, account.ProfileID)
-			
+
 			if account.SiegeSkinsData != nil {
-				line += fmt.Sprintf(" | Level: %d | Renown: %d | Credits: %d", 
+				line += fmt.Sprintf(" | Level: %d | Renown: %d | Credits: %d",
 					account.SiegeSkinsData.Level, account.SiegeSkinsData.Renown, account.SiegeSkinsData.Credits)
 				if account.SiegeSkinsData.Banned {
 					line += " | BANNED"
 				}
 			}
-			
 			lines = append(lines, line)
 		}
 		data = []byte(strings.Join(lines, "\n"))
