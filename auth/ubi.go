@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/yourusername/r6checker/models"
+	"github.com/iloever-pix/r6checker/models"
 )
 
 const (
